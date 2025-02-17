@@ -1,5 +1,5 @@
-hostname: "0.0.0.0"  # Listen on all interfaces by default
-port: 3000
+hostname: "127.0.0.1"  # Listen on all interfaces by default
+port: 8800
 
 # Debug configuration (optional)
 debug:
@@ -24,7 +24,7 @@ servers:
     args:
       - -y
       - "@modelcontextprotocol/server-filesystem"
-      - "/home/aaron"
+      - "g:/github"
 
   # run a an MCP server from local source
   puppeteer:
@@ -36,3 +36,16 @@ servers:
     command: tsx
     args:
       - "/home/aaron/AI/mcp-server-youtube-transcript/src/index.ts"
+
+  brave:
+    command: uv
+    args: 
+      - "--directory"
+      - "G:/github/search-server"
+      - "run"
+      - "search"
+
+  sequential-thinking:      
+    command: node
+    args: 
+      - "C:/Users/zhaoyj/AppData/Roaming/npm/node_modules/@modelcontextprotocol/server-sequential-thinking/dist/index.js"

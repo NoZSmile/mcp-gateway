@@ -2,7 +2,7 @@ import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { createLogger, format, transports } from 'winston';
 import { parse } from 'yaml';
-import { readFileSync } from 'fs';
+import { readFileSync, watch } from 'fs';
 import http from "http";
 import yargs from "yargs";
 import { hideBin } from "yargs/helpers";
@@ -103,6 +103,7 @@ async function getOrCreateSession(sessionId: string, serverName: string, config:
 
 class MCPGateway {
   private servers: Map<string, MCPServer> = new Map();
+  private httpServer?: http.Server; // 新增保存 HTTP 服务器实例
   private logger: ReturnType<typeof createLogger>;
 
   constructor(private config: GatewayConfig) {
@@ -201,9 +202,13 @@ class MCPGateway {
       // Handle root server path - establish SSE connection
       if (req.method === "GET") {
         this.logger.info(`New SSE connection for ${serverName}`);
-
+        let fullCommand = "";
         try {
           const serverConfig = this.config.servers[serverName];
+          fullCommand = `${serverConfig.command} ${serverConfig.args.join(" ")}`;
+          // 输出完整的命令行
+          this.logger.info(`Invoking MCP server with command: ${fullCommand}`);
+
           const stdioTransport = new StdioClientTransport({
             command: serverConfig.command,
             args: serverConfig.args,
@@ -224,20 +229,20 @@ class MCPGateway {
             this.logger.verbose('STDIO -> SSE:', msg);
             sseTransport.send(msg);
           };
-          
+
           res.on('close', () => {
             this.logger.info(`SSE connection closed for ${sessionId}`);
             server.sseTransport.close();
             server.stdioTransport.close();  
             this.servers.delete(sessionId);
           });
-          
+
           this.logger.info(`Starting transports for ${sessionId}`);
           await server.stdioTransport.start();
           await server.sseTransport.start();
 
         } catch (error) {
-          this.logger.error('Error setting up SSE connection:', error);
+          this.logger.error(`Error setting up SSE connection for command [${fullCommand}]: ${(error instanceof Error ? error.stack : error)}`);
           res.writeHead(500).end(String(error));
         }
         return;
@@ -280,8 +285,66 @@ class MCPGateway {
       res.writeHead(404).end();
     });
 
-    httpServer.listen(this.config.port, this.config.hostname);
-    this.logger.info(`MCP Gateway listening on ${this.config.hostname}:${this.config.port}`);
+    httpServer.listen(this.config.port, this.config.hostname, () => {
+      this.logger.info(`MCP Gateway listening on ${this.config.hostname}:${this.config.port}`);
+    });
+    this.httpServer = httpServer; // 保存 HTTP 服务器实例
+  }
+
+  // 新增停止方法
+  async stop() {
+    if (this.httpServer) {
+      return new Promise<void>(resolve => {
+        this.httpServer!.close(() => {
+          resolve();
+        });
+      });
+    }
+  }
+
+  // 修改 reload 方法，若监听地址未变则直接更新配置，不关闭侦听
+  async reload(newConfig: GatewayConfig) {
+    if (newConfig.hostname === this.config.hostname && newConfig.port === this.config.port) {
+      this.logger.info("正在使用新配置更新服务（不关闭侦听）...");
+      this.config = newConfig;
+      this.logger = createLogger({
+        level: newConfig.debug?.level || 'info',
+        format: format.combine(
+          format.timestamp(),
+          format.colorize(),
+          format.printf(({ level, message, timestamp, ...metadata }) => {
+            let msg = `${timestamp} [${level}]: ${message}`;
+            if (Object.keys(metadata).length > 0) {
+              msg += ` ${JSON.stringify(metadata)}`;
+            }
+            return msg;
+          })
+        ),
+        transports: [ new transports.Console() ]
+      });
+      return;
+    }
+    // 如果监听地址发生变化，则需要关闭并重启监听
+    this.logger.info("监听地址变更，重新启动服务...");
+    await this.stop();
+    await new Promise(resolve => setTimeout(resolve, 1000));
+    this.config = newConfig;
+    this.logger = createLogger({
+      level: newConfig.debug?.level || 'info',
+      format: format.combine(
+        format.timestamp(),
+        format.colorize(),
+        format.printf(({ level, message, timestamp, ...metadata }) => {
+          let msg = `${timestamp} [${level}]: ${message}`;
+          if (Object.keys(metadata).length > 0) {
+            msg += ` ${JSON.stringify(metadata)}`;
+          }
+          return msg;
+        })
+      ),
+      transports: [ new transports.Console() ]
+    });
+    await this.start();
   }
 }
 
@@ -325,6 +388,23 @@ try {
     gateway.start().catch(error => {
       console.error('Failed to start gateway:', error);
       process.exit(1);
+    });
+
+    // 修改配置文件监控，读取新配置并调用 reload() 重新加载，而不是退出程序
+    watch(configPath, (eventType, filename) => {
+      if (eventType === 'change') {
+        console.log('配置文件已修改，重新加载配置文件...');
+        (async () => {
+          try {
+            const newConfigFile = readFileSync(configPath, 'utf8');
+            const newConfig = parse(newConfigFile) as GatewayConfig;
+            // 可添加必要的配置验证或默认值逻辑
+            await gateway.reload(newConfig);
+          } catch (error) {
+            console.error('重新加载配置时发生错误：', error);
+          }
+        })();
+      }
     });
   }
 } catch (error) {
